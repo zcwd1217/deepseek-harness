@@ -14,6 +14,7 @@
   - [2.4 能力接缝（Capability Seam）](#24-能力接缝capability-seam)
   - [2.5 Turn / Step 执行流](#25-turn--step-执行流)
   - [2.6 事件体系](#26-事件体系)
+  - [2.7 架构与模块关系图](#27-架构与模块关系图)
 - [3. 仓库布局](#3-仓库布局)
 - [4. 主要模块与职责](#4-主要模块与职责)
   - [4.1 core — 产品 API 主干](#41-core--产品-api-主干)
@@ -126,6 +127,138 @@ turn/end
 | Session 事件（持久） | `session/event`、`turn/start`、`user/message`、`tool/call`… | 必须在重载后存活的事实，追加进日志并广播 |
 | Agent 事件（活） | `agent/created`、`agent/pre-step`、`agent/request`、`agent/assistant-stream`、`agent/request-error`、`agent/turn-stopping` | 观察/拦截进行中的工作，携带活 `Agent` |
 | 能力事件（活） | `fs/*`、`tools/*`、`telemetry/*`、`llm/stream` | 为接缝附加策略与适配器，不导入循环 |
+
+### 2.7 架构与模块关系图
+
+以下两图用 Mermaid 绘制（GitHub 与仓库 VitePress 站点均原生渲染；PlantUML 无法被 GitHub 直接渲染，故不采用）。第一张展示运行时分层与数据流，第二张展示包之间的依赖方向。
+
+**图 1 — 整体架构分层**：客户端经不同传输进入各应用形态；所有形态最终都是同一棵由 `dsh` CLI 组合出的 Cordis 插件树；Provider 实现可整体替换（本地 ↔ SSH 远程 ↔ 沙箱），数据统一落盘 Harness Home。
+
+```mermaid
+flowchart TB
+  subgraph clients["客户端层"]
+    webui["Web GUI（浏览器）"]
+    desktop["Electron Desktop"]
+    sdkclient["TypeScript / Python SDK"]
+    acpclient["ACP 自动化客户端"]
+    headlessTask["headless 一次性任务"]
+  end
+
+  webui -->|"HTTPS：静态资源 + /api RPC"| hostside
+  desktop -->|"Node IPC → Web Host"| hostside
+  sdkclient -->|"stdio JSON-RPC"| sdkserver["dsh-sdk-server"]
+  acpclient -->|"ACP 协议"| acpserver["dsh-acp server"]
+  headlessTask -->|"pnpm dsh --profile headless"| cli
+
+  subgraph hostside["Web 服务面（Host 半边）"]
+    webserver["host/webserver + frontend-static<br/>静态资源 + 浏览器认证"]
+    controllers["api/* controllers<br/>session / workspace / jobs / terminal …"]
+    webserver --> controllers
+  end
+
+  subgraph composition["应用组合层"]
+    cli["dsh CLI（apps/cli）<br/>runProfile()"]
+    appboot["app-boot：profile + bundle + patch 组合"]
+    loader["Cordis Loader 装配插件树"]
+    cli --> appboot --> loader
+  end
+
+  subgraph tree["Cordis 插件树（一切皆插件）"]
+    direction TB
+    subgraph spine["核心主干 packages/core"]
+      sessions["ctx.sessions 会话日志"]
+      agentloop["ctx.agentLoop Turn/Step 驱动"]
+      agents["ctx.agents Agent 注册表"]
+      tools["ctx.tools 工具管道"]
+      prompt["ctx.systemPrompt"]
+      llm["ctx.llm 模型流"]
+    end
+    subgraph seams["能力接缝（Service Definition）"]
+      shell["ctx.shell / ctx.subprocess"]
+      fs["ctx.fs"]
+      sandbox["ctx.sandbox"]
+      more["ctx.terminals · ctx.web · ctx.subagents<br/>ctx.jobs · ctx.skills · ctx.workflowEngine …"]
+    end
+    subgraph dataplane["数据面"]
+      persistence["SessionPersistence：session.vN.jsonl(.zstd)"]
+      projection["session-projection：ctx.sessionProjections"]
+      query["session-query：SQLite FTS5 检索"]
+      platform["settings · credentials · storage · telemetry"]
+    end
+  end
+
+  subgraph providers["可替换 Provider 实现"]
+    local["bash-local · fs-local · sandbox-local<br/>（bwrap / Landlock / Seatbelt）"]
+    remote["llm-pi-ai · llm-deepseek-*<br/>ssh 族：fs-ssh · subprocess-ssh · sandbox-ssh"]
+  end
+
+  hostside -->|"驱动 ctx.agents / 读 session/event"| spine
+  sdkserver --> spine
+  acpserver --> spine
+  loader -->|"挂载"| tree
+  providers -->|"注册到接缝"| seams
+
+  agentloop -->|"组装并流式调用"| llm
+  agentloop -->|"execute()"| tools
+  agentloop -->|"追加 turn/step/tool 事件"| sessions
+  tools -->|"经接缝执行"| seams
+
+  tree -->|"持久化"| home[("Harness Home $DSH_HOME<br/>默认 ~/.dsh")]
+```
+
+**图 2 — 模块依赖关系**：核心规则是"扩展插件依赖 Service Definition，绝不依赖具体 Provider"。左侧 Provider 注册到接缝；右侧 Consumer（模型工具、UI/hook 插件）只面向契约编程；agent-loop 作为可替换的默认驱动，向下依赖各服务定义。
+
+```mermaid
+flowchart LR
+  subgraph defs["Service Definition（接缝契约）"]
+    llmSvc["dsh-llm：ctx.llm"]
+    sessionSvc["dsh-session：ctx.sessions"]
+    toolsSvc["dsh-tools：ctx.tools"]
+    agentSvc["dsh-agent：ctx.agents + agent/* 事件"]
+    shellSvc["dsh-shell：ctx.shell"]
+    fsSvc["dsh-fs：ctx.fs"]
+    sbxSvc["dsh-sandbox：ctx.sandbox"]
+  end
+
+  subgraph drive["驱动与组装"]
+    loop["dsh-agent-loop（可替换的默认驱动）"]
+    promptSvc["dsh-system-prompt：ctx.systemPrompt"]
+  end
+
+  subgraph provs["Service Provider（注册实现）"]
+    llmProv["llm-pi-ai · llm-deepseek-api-key / -account"]
+    bashProv["bash-local · bash-sandbox · pwsh-*"]
+    fsProv["fs-local · fs-sandbox"]
+    sbxProv["sandbox-local · sandbox-policy · sandbox-windows-acl"]
+    sshProv["fs-ssh · subprocess-ssh · sandbox-ssh"]
+  end
+
+  subgraph consumers["Consumer（模型工具与扩展插件）"]
+    toolBash["tool-bash / tool-pwsh"]
+    toolFs["tool-fs · tool-fs-search · tool-str-replace-editor"]
+    toolWeb["tool-web · tool-jobs · tool-subagent · tool-skill …"]
+    uiHook["ui-* · hook · 遥测等扩展插件"]
+  end
+
+  llmProv -->|"注册适配器"| llmSvc
+  bashProv -->|"注册执行器"| shellSvc
+  fsProv -->|"注册后端"| fsSvc
+  sbxProv -->|"注册 confinement 后端"| sbxSvc
+  sshProv -->|"映射到 ctx.fs / ctx.subprocess / ctx.sandbox"| fsSvc
+
+  toolBash -->|"依赖契约"| shellSvc
+  toolFs -->|"依赖契约"| fsSvc
+  toolWeb -->|"依赖契约"| toolsSvc
+  loop -->|"请求模型"| llmSvc
+  loop -->|"组装 prompt"| promptSvc
+  promptSvc -->|"工具 schema"| toolsSvc
+  loop -->|"追加 turn/step/tool 事件"| sessionSvc
+  loop -->|"实现接口"| agentSvc
+  uiHook -->|"观察 / 驱动"| agentSvc
+  uiHook -->|"读 session/event"| sessionSvc
+```
+
+读图提示：换一个 Provider 即改变整个产品的执行世界——把 `fs-local`/`bash-local`/`sandbox-local` 换成 `ssh` 族即可把 Bash、PTY、文件系统一起迁到远程沙箱；把 `llm-pi-ai` 换成其他 `ctx.llm` 适配器即切换模型供应商，工具与循环零改动。
 
 -----
 
